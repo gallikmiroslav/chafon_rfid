@@ -1,3 +1,5 @@
+// MIT License
+//
 // Copyright © 2023 Miroslav Gallik
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
@@ -23,9 +25,10 @@
 #include "rfid.h"
 
 #define CMD_OK      0x00
-#define CMD_FAIL    0xf9
+#define CMD_FAIL    0xA1
+#define CMD_CRC_ERR 0xA2
 
-#ifdef DEBUG
+#ifdef DEBUG_PRINT
 #define DBG_PRINT                                printf
 #define DBG_PRINT_BUFF(buff, len)                print_buff(buff, len)
 #define DBG_PRINT_PACKET(buff_name, buff, len)   print_packet(buff_name, buff, len)
@@ -269,13 +272,86 @@ void recv_command_va(rfid_t *rfid, int flags, ...)
     recv_buffer(rfid->port_fd, NULL, &rfid->state, &crc2, 2);
 
     //test results
-
     if (rfid->header.status != CMD_OK)
         rfid->state = rfid->header.status;
     if (crc1 != crc2)
-        rfid->state = CMD_FAIL;
-
+    {
+        DBG_PRINT(" CRC_ERR 0x%04X != 0x%04X", crc1, crc2);
+        rfid->state = CMD_CRC_ERR;
+    }
     DBG_PRINT("\n");
+}
+
+void multi_packet_response(rfid_t *rfid, tag_inventory_cb tag_callback)
+{
+    int fd = rfid->port_fd;
+    uint16_t crc1;
+    uint16_t crc2;
+    uint8_t antenna;
+    uint8_t num;
+    uint8_t prm;
+
+    uint8_t d_len;
+    uint8_t d_data[128];
+    uint8_t rssi;
+
+    if (rfid->state != CMD_OK)
+        return;
+
+    do
+    {
+        crc1 = CRC_INIT;
+        DBG_PRINT("RECV:  ");
+        recv_buffer(fd, &crc1, &rfid->state, &rfid->header, 4);
+        DBG_PRINT("\x1b[34m");
+        if (rfid->header.status < 0x05)
+        {
+            switch (rfid->header.cmd)
+            {
+                case 0x01:
+                case 0x0f:
+                case 0x1a:
+                case 0x1b:
+                    recv_buffer_va(fd, &crc1, &rfid->state, &antenna, 1, &num, 1, NULL);
+                    for (size_t i = 0; i < num; i++)
+                    {
+                        recv_buffer(fd, &crc1, &rfid->state, &d_len, 1);
+                        d_len &= 0x7f;
+                        recv_buffer_va(fd, &crc1, &rfid->state, d_data, d_len, &rssi, 1, NULL);
+                        tag_callback(rfid, antenna, num, i, d_len, d_data, rssi, 0);
+                    }
+                    break;
+                case 0x19:
+                    recv_buffer_va(fd, &crc1, &rfid->state, &antenna, 1, &num, 1, NULL);
+                    for (size_t i = 0; i < num; i++)
+                    {
+                        recv_buffer_va(fd, &crc1, &rfid->state, &prm, 1, &d_len, 1, NULL);
+                        recv_buffer_va(fd, &crc1, &rfid->state, d_data, d_len, &rssi, 1, NULL);
+                        tag_callback(rfid, antenna, num, i, d_len, d_data, rssi, prm);
+                    }
+                    break;
+                case 0x72:
+                    recv_buffer_va(fd, &crc1, &rfid->state, &num, 1, NULL);
+                    for (size_t i = 0; i < num; i++)
+                    {
+                        recv_buffer_va(fd, &crc1, &rfid->state, &antenna, 1, &d_len, 1, NULL);
+                        recv_buffer_va(fd, &crc1, &rfid->state, d_data, d_len, &rssi, 1, &prm, 1, NULL);
+                        tag_callback(rfid, antenna, num, i, d_len, d_data, rssi, prm);
+                    }
+                    break;
+            }
+        } else
+            rfid->state = rfid->header.status;
+
+        DBG_PRINT("\x1b[0m");
+        recv_buffer(fd, NULL, &rfid->state, &crc2, 2);
+        if (crc1 != crc2)
+        {
+            DBG_PRINT(" CRC_ERR 0x%04X != 0x%04X", crc1, crc2);
+            rfid->state = CMD_CRC_ERR;
+        }
+        DBG_PRINT("\n");
+    } while ((rfid->header.status == 0x03) && ((rfid->state == CMD_OK) || (rfid->state == CMD_CRC_ERR)));
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -303,13 +379,17 @@ int rfid_init(rfid_t *rfid, const char *device, speed_t speed)
                                                 // no canonical processing
         tty.c_oflag = 0;                        // no remapping, no delays
         tty.c_cc[VMIN]  = 0;                    // read doesn't block
-        tty.c_cc[VTIME] = 250;                    // 25 seconds read timeout
+        tty.c_cc[VTIME] = 250;                  // 25 seconds read timeout
         tty.c_iflag &= ~(IXON | IXOFF | IXANY); // shut off xon/xoff ctrl
         tty.c_cflag |= (CLOCAL | CREAD);        // ignore modem controls,
                                                 // enable reading
         tty.c_cflag &= ~(PARENB | PARODD);      // shut off parity
         tty.c_cflag &= ~CSTOPB;
         tty.c_cflag &= ~CRTSCTS;
+
+        tty.c_oflag &=~(ONLCR|OCRNL);           // example how stupid default values are
+        tty.c_iflag &=~(INLCR|ICRNL);           //
+
         tcsetattr(rfid->port_fd, TCSANOW, &tty);
         return 0;
     } else
@@ -327,10 +407,8 @@ void rfid_done(rfid_t *rfid)
 
 void rfid_set_epc(rfid_t *rfid, void *epc, uint8_t len)
 {
-    if (len > 32)
-        len = 32;
     memset(rfid->epc_data, 0, 32);
-    if (epc && len)
+    if (epc && len && (len < 33))
         memcpy(rfid->epc_data, epc, len);
     rfid->epc_len = len;
 }
@@ -367,85 +445,46 @@ void rfid_set_address(rfid_t *rfid, uint8_t addr)
 // ---------------------------------------------------------------------------------------------------------------------
 // --- ISO18000-6C commands --------------------------------------------------------------------------------------------
 // ---------------------------------------------------------------------------------------------------------------------
-void rfid_6c_tag_inventory(rfid_t *rfid, uint8_t q_value, uint8_t session, uint8_t tid_addr, uint8_t tid_len,
-                           uint8_t target, uint8_t ant, uint8_t scan_time,
+int rfid_6c_tag_inventory(rfid_t *rfid, uint8_t q_value, uint8_t session, uint8_t tid_addr, uint8_t tid_len,
+                           uint8_t target, uint8_t ant, uint8_t scan_time, rfid_stat_t *stat,
                            tag_inventory_cb tag_callback)
 {
-    int fd = rfid->port_fd;
-    uint16_t crc1;
-    uint16_t crc2;
-    uint8_t t_ant;
-    uint8_t t_num;
-    uint8_t t_len;
-    uint8_t t_buff[128];
-    uint8_t t_rssi;
+    if (stat)   // requesting statistic data
+        q_value |= 0x80;
+    else
+        q_value &= 0x7f;
 
-//    if (!target && !ant && !scan_time)
-//        send_command_va(rfid, 0x01, &q_value, 1, &session, 1, &rfid->mask_mem, 1,
-//                        &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len,
-//                        &tid_addr, 1, &tid_len, 1, NULL);
-//    else
-        send_command_va(rfid, 0x01, &q_value, 1, &session, 1, &rfid->mask_mem, 1,
-                        &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len,
-                        &tid_addr, 1, &tid_len, 1, &target, 1, &ant, 1, &scan_time, 1, NULL);
-    if (rfid->state != CMD_OK)
-        return;
+    send_command_va(rfid, 0x01, &q_value, 1, &session, 1, &rfid->mask_mem, 1,
+                    &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len,
+                    &tid_addr, 1, &tid_len, 1, &target, 1, &ant, 1, &scan_time, 1, NULL);
+    multi_packet_response(rfid, tag_callback);
 
-    do
-    {
-        crc1 = CRC_INIT;
-        DBG_PRINT("RECV:  ");
-        recv_buffer(fd, &crc1, &rfid->state, &rfid->header, 4);
-        if (rfid->header.status < 0x05)
-        {
-            DBG_PRINT("\x1b[34m");
-            recv_buffer(fd, &crc1, &rfid->state, &t_ant, 1);
-            recv_buffer(fd, &crc1, &rfid->state, &t_num, 1);
-            for (int i = 0; i < t_num; ++i)
-            {
-                recv_buffer(fd, &crc1, &rfid->state, &t_len, 1);
-                recv_buffer(fd, &crc1, &rfid->state, t_buff, t_len & 0x79);
-                recv_buffer(fd, &crc1, &rfid->state, &t_rssi, 1);
-                tag_callback(rfid, t_ant, t_num, i, t_len, t_buff, t_rssi, 0);
-            }
-            DBG_PRINT("\x1b[0m");
-            recv_buffer(fd, NULL, &rfid->state, &crc2, 2);
-            DBG_PRINT("\n");
-        } else
-        {
-            // todo error handling
-            recv_command_va(rfid, 1, NULL);
-        }
-    } while (rfid->header.status == 0x03);
-
-    if (q_value & 0x80)
-    {
-        recv_command_va(rfid, 0, NULL);
-    }
-    //return ???;
+    if (stat)
+        recv_command_va(rfid, 0, &stat->ant, 1, &stat->read_rate, 2, &stat->total_count, 4, NULL);
+    return rfid->state;
 }
 
-int rfid_6c_read_data(rfid_t *rfid, uint8_t mem, uint8_t word_ptr, uint8_t num, uint8_t *response)
+int rfid_6c_read_data(rfid_t *rfid, uint8_t mem, uint16_t word_ptr, uint8_t num, uint8_t *response)
 {
     send_command_va(rfid, 0x02, &rfid->epc_len, 1, rfid->epc_data, rfid->epc_len * 2,
-                    &mem, 1, &word_ptr, 1, &num, 1, &rfid->password, 4, &rfid->mask_mem, 1,
+                    &mem, 1, &word_ptr, 2, &num, 1, &rfid->password, 4, &rfid->mask_mem, 1,
                     &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len, NULL);
     recv_command_va(rfid, 0, response, num * 2, NULL);
     return rfid->state;
 }
 
-int rfid_6c_write_data(rfid_t *rfid, uint8_t w_num, uint8_t mem, uint8_t word_ptr, uint8_t *wdt)
+int rfid_6c_write_data(rfid_t *rfid, uint8_t w_num, uint8_t mem, uint16_t word_ptr, uint8_t *wdt)
 {
     send_command_va(rfid, 0x03, &w_num, 1, &rfid->epc_len, 1, rfid->epc_data, rfid->epc_len * 2,
-                    &mem, 1, &word_ptr, 1, wdt, w_num * 2, &rfid->password, 4,
+                    &mem, 1, &word_ptr, 2, wdt, w_num * 2, &rfid->password, 4,
                     &rfid->mask_mem, 1, &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len, NULL);
     recv_command_va(rfid, 0, NULL);
     return rfid->state;
 }
 
-int rfid_6c_write_epc(rfid_t *rfid, uint8_t e_num, uint32_t password, uint8_t *w_epc)
+int rfid_6c_write_epc(rfid_t *rfid, uint8_t e_num, uint8_t *w_epc)
 {
-    send_command_va(rfid, 0x04, &e_num, 1, &password, 4, w_epc, e_num * 2, NULL);
+    send_command_va(rfid, 0x04, &e_num, 1, &rfid->password, 4, w_epc, e_num * 2, NULL);
     recv_command_va(rfid, 0, NULL);
     return rfid->state;
 }
@@ -459,24 +498,181 @@ int rfid_6c_kill_tag(rfid_t *rfid, uint32_t kill_password)
     return rfid->state;
 }
 
-// todo 0x06 Set memory read/write protection for specific memory
-// todo 0x07 Block erase
-// todo 0x08 Read protection configuration (according to EPC number)
-// todo 0x09 Read protection configuration (Without EPC number)
-// todo 0x0a Unlock read protection
-// todo 0x0b Read protection status check
-// todo 0x0c EAS configuration
-// todo 0x0d EAS alert detection
-// todo 0x0f Single tag inventory
-// todo 0x10 Write blocks
-// todo 0x11 Obtain Monza4QT working parameters
-// todo 0x12 Modify Monza4QT working parameters
-// todo 0x15 Extended data reading with assigned mask
-// todo 0x16 Extended data writing with assigned mask
-// todo 0x18 Inventory with memory buffer
-// todo 0x19 Mix inventory
-// todo 0x1a Inventory with EPC number
-// todo 0x1b QT inventory
+int rfid_6c_set_protection(rfid_t *rfid, uint8_t select, uint8_t protect)
+{
+    send_command_va(rfid, 0x06, &rfid->epc_len, 1, rfid->epc_data, rfid->epc_len * 2,
+                    &select, 1, &protect, 1, &rfid->password, 4,
+                    &rfid->mask_mem, 1, &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len, NULL);
+    recv_command_va(rfid, 0, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_block_erase(rfid_t *rfid, uint8_t mem, uint16_t word_ptr, uint8_t num)
+{
+    send_command_va(rfid, 0x07, &rfid->epc_len, 1, rfid->epc_data, rfid->epc_len * 2,
+                    &mem, 1, &word_ptr, 2, &num, 1, &rfid->password, 4,
+                    &rfid->mask_mem, 1, &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len, NULL);
+    recv_command_va(rfid, 0, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_read_protection_config_epc(rfid_t *rfid)
+{
+    send_command_va(rfid, 0x08, &rfid->epc_len, 1, rfid->epc_data, rfid->epc_len * 2,
+                    &rfid->password, 4,
+                    &rfid->mask_mem, 1, &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len, NULL);
+    recv_command_va(rfid, 0, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_read_protection_config(rfid_t *rfid)
+{
+    send_command_va(rfid, 0x09, &rfid->password, 4, NULL);
+    recv_command_va(rfid, 0, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_read_protection_unlock(rfid_t *rfid)
+{
+    send_command_va(rfid, 0x0a, &rfid->password, 4, NULL);
+    recv_command_va(rfid, 0, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_read_protection_check(rfid_t *rfid, uint8_t *protect)
+{
+    send_command_va(rfid, 0x0b, NULL);
+    recv_command_va(rfid, 0, protect, 1, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_eas(rfid_t *rfid, uint8_t eas)
+{
+    send_command_va(rfid, 0x0c, &rfid->epc_len, 1, rfid->epc_data, rfid->epc_len * 2,
+                    &rfid->password, 4, &eas, 1,
+                    &rfid->mask_mem, 1, &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len,
+                    NULL);
+    recv_command_va(rfid, 0, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_eas_alert(rfid_t *rfid)
+{
+    send_command_va(rfid, 0x0d, NULL);
+    recv_command_va(rfid, 0, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_single_tag_inventory(rfid_t *rfid, tag_inventory_cb tag_callback)
+{
+    send_command_va(rfid, 0x0f, NULL);
+    multi_packet_response(rfid, tag_callback);
+    return rfid->state;
+}
+
+int rfid_6c_write_block(rfid_t *rfid, uint8_t mem, uint8_t wordptr, uint8_t *data, uint8_t wordlen)
+{
+    send_command_va(rfid, 0x10, &wordlen, 1, &rfid->epc_len, 1, rfid->epc_data, rfid->epc_len * 2,
+                    &mem, 1, &wordptr, 1, data, wordlen * 2, &rfid->password, 4,
+                    &rfid->mask_mem, 1, &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len,
+                    NULL);
+    recv_command_va(rfid, 0, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_monza4qt_get_params(rfid_t *rfid, uint8_t *control)
+{
+    uint8_t tmp;
+    send_command_va(rfid, 0x11, &rfid->epc_len, 1, rfid->epc_data, rfid->epc_len * 2,
+                    &rfid->password, 4,
+                    &rfid->mask_mem, 1, &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len,
+                    NULL);
+    recv_command_va(rfid, 0, &tmp, 1, control, 1, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_monza4qt_set_params(rfid_t *rfid, uint8_t control)
+{
+    uint8_t tmp = 0;
+    send_command_va(rfid, 0x12, &rfid->epc_len, 1, rfid->epc_data, rfid->epc_len * 2,
+                    &tmp, 1, &control, 1, &rfid->password, 4,
+                    &rfid->mask_mem, 1, &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len,
+                    NULL);
+    recv_command_va(rfid, 0, NULL);
+    return rfid->state;
+}
+
+
+int rfid_6c_extended_read(rfid_t *rfid, uint8_t mem, uint16_t word_ptr, uint8_t num, uint8_t *data)
+{
+    send_command_va(rfid, 0x15, &rfid->epc_len, 1, rfid->epc_data, rfid->epc_len * 2,
+                    &mem, 1, &word_ptr, 2, &num, 1, &rfid->password, 4,
+                    &rfid->mask_mem, 1, &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len, NULL);
+    recv_command_va(rfid, 0, data, num * 2, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_extended_write(rfid_t *rfid, uint8_t mem, uint16_t word_ptr, uint8_t num, uint8_t *data)
+{
+    send_command_va(rfid, 0x16, &num, 1, &rfid->epc_len, 1, rfid->epc_data, rfid->epc_len * 2,
+                    &mem, 1, &word_ptr, 2, &data, num * 2, &rfid->password, 4,
+                    &rfid->mask_mem, 1, &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len, NULL);
+    recv_command_va(rfid, 0, NULL);
+    return rfid->state;
+}
+
+void rfid_6c_tag_inventory_buffer (rfid_t *rfid, uint8_t q_value, uint8_t session, uint8_t tid_addr, uint8_t tid_len,
+                           uint8_t target, uint8_t ant, uint8_t scan_time,
+                           uint16_t *buff_cnt, uint16_t *tag_num)
+{
+    send_command_va(rfid, 0x18, &q_value, 1, &session, 1, &rfid->mask_mem, 1,
+                    &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len,
+                    &tid_addr, 1, &tid_len, 1, &target, 1, &ant, 1, &scan_time, 1, NULL);
+    recv_command_va(rfid, 0, buff_cnt, 2, tag_num, 2, NULL);
+}
+
+int rfid_6c_mix_inventory(rfid_t *rfid, uint8_t q_value, uint8_t session, uint8_t read_mem, uint16_t read_addr, uint8_t read_len,
+                          uint8_t target, uint8_t ant, uint8_t scan_time, rfid_stat_t *stat, tag_inventory_cb tag_callback)
+{
+    if (stat)   // requesting statistic data
+        q_value |= 0x80;
+    else
+        q_value &= 0x7f;
+
+    send_command_va(rfid, 0x19, &q_value, 1, &session, 1,
+                    &rfid->mask_mem, 1, &rfid->mask_addr, 2, &rfid->mask_len, 1, rfid->mask_data, rfid->mask_data_len,
+                    &read_mem, 1, &read_addr, 2, &read_len, 1, &rfid->password, &target, 1, &ant, 1, &scan_time, 1, NULL);
+    multi_packet_response(rfid, tag_callback);
+
+    if (stat)
+        recv_command_va(rfid, 0, &stat->ant, 1, &stat->read_rate, 2, &stat->total_count, 4, NULL);
+    return rfid->state;
+}
+
+int rfid_6c_epc_inventory(rfid_t *rfid, uint8_t match_type, uint16_t match_len, uint16_t match_offset, uint8_t *epc_data,
+                          tag_inventory_cb tag_callback)
+{
+    uint8_t len = (match_len + 7) / 8;
+    send_command_va(rfid, 0x1a, &match_type, 1, &match_len, 2, &match_offset, 2, epc_data, len, NULL);
+    multi_packet_response(rfid, tag_callback);
+    return rfid->state;
+}
+
+int rfid_6c_qt_inventory(rfid_t *rfid, uint8_t q_value, uint8_t session, uint8_t target, uint8_t ant, uint8_t scan_time,
+                         rfid_stat_t *stat, tag_inventory_cb tag_callback)
+{
+    if (stat)   // requesting statistic data
+        q_value |= 0x80;
+    else
+        q_value &= 0x7f;
+
+    send_command_va(rfid, 0x1b, &q_value, 1, &session, 1, &target, 1, &ant, 1, &scan_time, 1, NULL);
+    multi_packet_response(rfid, tag_callback);
+
+    if (stat)
+        recv_command_va(rfid, 0, &stat->ant, 1, &stat->read_rate, 2, &stat->total_count, 4, NULL);
+    return rfid->state;
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // --- ISO18000-6B commands --------------------------------------------------------------------------------------------
@@ -628,29 +824,8 @@ int rfid_x_get_max_epc_len(rfid_t *rfid, uint8_t *len)
 
 int rfid_x_buffer_read(rfid_t *rfid, tag_inventory_cb tag_callback)
 {
-    int fd = rfid->port_fd;
-    uint16_t crc1 = CRC_INIT;
-    uint16_t crc2;
-    uint8_t cnt;
-
-    uint8_t t_ant;
-    uint8_t t_len;
-    uint8_t t_data[128];
-    uint8_t t_rssi;
-    uint8_t t_cnt;
-    send_command_va(rfid, 0x72, fd, NULL);
-
-    do
-    {
-        // read header
-        recv_buffer_va(fd, &crc1, &rfid->state, &rfid->header, 4, &cnt, 1, NULL);
-        for (int i = 0; i < cnt; ++i)
-        {
-            recv_buffer_va(fd, &crc1, &rfid->state, &t_ant, 1, &t_len, 1, t_data, t_len, &t_rssi, 1, &t_cnt, 1, NULL);
-            tag_callback(rfid, t_ant, cnt, i, t_len, t_data, t_rssi, t_cnt);
-        }
-        recv_buffer_va(fd, NULL, &rfid->state, &crc2, 2, NULL);
-    } while(rfid->header.status == 0x03);
+    send_command_va(rfid, 0x72, NULL);
+    multi_packet_response(rfid, tag_callback);
     return rfid->state;
 }
 
@@ -784,7 +959,6 @@ int rfid_x_get_drm(rfid_t *rfid, uint8_t *drm_mode)
     recv_command_va(rfid, 0, drm_mode, 1, NULL);
     return rfid->state;
 }
-
 
 int rfid_x_get_antenna_return_loss(rfid_t *rfid, uint32_t test_freq, uint8_t antenna, uint8_t *return_loss)
 {

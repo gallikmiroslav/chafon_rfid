@@ -20,7 +20,7 @@
 #include "rfid.h"
 
 void tag(rfid_t *rfid, uint8_t ant, uint16_t num, uint16_t id, uint8_t data_len, uint8_t *data,
-         uint8_t rssi, uint8_t count)
+         uint8_t rssi, uint8_t prm)
 {
     // todo do something
 }
@@ -28,6 +28,7 @@ void tag(rfid_t *rfid, uint8_t ant, uint16_t num, uint16_t id, uint8_t data_len,
 void tests(rfid_t *rfid)
 {
     rfid_reader_info_t ri;
+    rfid_stat_t stat;
     rfid_reader_working_mode_t wm;
     uint8_t tmp;
 
@@ -43,8 +44,7 @@ void tests(rfid_t *rfid)
     rfid_x_set_reader_mode(rfid, 0x00);
     for (int i = 0; i < 5000; ++i)
     {
-        //rfid_6c_tag_inventory(rfid, 0x4, 0x00, 2, 15, 0, 0x82, 3, tag);
-        rfid_6c_tag_inventory(rfid, 0x4, 0x00, 0, 4, 0, 0x82, 10, tag);
+        rfid_6c_tag_inventory(rfid, 0x04, 0x00, 0, 4, 0, 0x82, 10, &stat, tag);
         sleep(1);
     }
 

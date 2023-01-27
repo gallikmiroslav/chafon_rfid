@@ -1,3 +1,5 @@
+// MIT License
+//
 // Copyright © 2023 Miroslav Gallik
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
@@ -83,6 +85,13 @@ typedef struct
 
 typedef struct
 {
+    uint8_t ant;
+    uint16_t read_rate;
+    uint32_t total_count;
+} rfid_stat_t;
+
+typedef struct
+{
     int port_fd;
     int state;
     rfid_header_t header;
@@ -102,28 +111,61 @@ typedef struct
 } rfid_t;
 
 typedef void (*tag_inventory_cb)(rfid_t *rfid, uint8_t ant, uint16_t num, uint16_t id, uint8_t data_len, uint8_t *data,
-                                 uint8_t rssi, uint8_t count);
+                                 uint8_t rssi, uint8_t prm);
 
+// ---------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------
 int rfid_init(rfid_t *rfid, const char *device, speed_t speed);
 void rfid_done(rfid_t *rfid);
 
-void rfid_set_epc(rfid_t *rfid, void *epc, uint8_t len);
+__attribute__((unused)) void rfid_set_epc(rfid_t *rfid, void *epc, uint8_t len);
 void rfid_set_password(rfid_t *rfid, uint32_t password);
 // Warning: mask_data must be valid during commands execution. There is no copy operation
 void rfid_set_mask(rfid_t *rfid, uint8_t mask_mem, uint16_t mask_addr, uint8_t *mask_data, uint8_t mask_len);
 void rfid_set_address(rfid_t *rfid, uint8_t addr);
 
-void rfid_6c_tag_inventory(rfid_t *rfid, uint8_t q_value, uint8_t session, uint8_t tid_addr, uint8_t tid_len,
-                           uint8_t target, uint8_t ant, uint8_t scan_time,
-                           tag_inventory_cb tag_callback);
-int rfid_6c_read_data(rfid_t *rfid, uint8_t mem, uint8_t word_ptr, uint8_t num, uint8_t *response);
-int rfid_6c_write_data(rfid_t *rfid, uint8_t w_num, uint8_t mem, uint8_t word_ptr, uint8_t *wdt);
-int rfid_6c_write_epc(rfid_t *rfid, uint8_t e_num, uint32_t password, uint8_t *w_epc);
+// ---------------------------------------------------------------------------------------------------------------------
+// --- ISO18000-6C commands --------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------
+int rfid_6c_tag_inventory(rfid_t *rfid, uint8_t q_value, uint8_t session, uint8_t tid_addr, uint8_t tid_len,
+                          uint8_t target, uint8_t ant, uint8_t scan_time, rfid_stat_t *stat,
+                          tag_inventory_cb tag_callback);
+int rfid_6c_read_data(rfid_t *rfid, uint8_t mem, uint16_t word_ptr, uint8_t num, uint8_t *response);
+int rfid_6c_write_data(rfid_t *rfid, uint8_t w_num, uint8_t mem, uint16_t word_ptr, uint8_t *wdt);
+int rfid_6c_write_epc(rfid_t *rfid, uint8_t e_num, uint8_t *w_epc);
 int rfid_6c_kill_tag(rfid_t *rfid, uint32_t kill_password);
+int rfid_6c_set_protection(rfid_t *rfid, uint8_t select, uint8_t protect);
+int rfid_6c_block_erase(rfid_t *rfid, uint8_t mem, uint16_t word_ptr, uint8_t num);
+int rfid_6c_read_protection_config_epc(rfid_t *rfid);
+int rfid_6c_read_protection_config(rfid_t *rfid);
+int rfid_6c_read_protection_unlock(rfid_t *rfid);
+int rfid_6c_read_protection_check(rfid_t *rfid, uint8_t *protect);
+int rfid_6c_eas(rfid_t *rfid, uint8_t eas);
+int rfid_6c_eas_alert(rfid_t *rfid);
+int rfid_6c_single_tag_inventory(rfid_t *rfid, tag_inventory_cb tag_callback);
+int rfid_6c_write_block(rfid_t *rfid, uint8_t mem, uint8_t wordptr, uint8_t *data, uint8_t wordlen);
+int rfid_6c_monza4qt_get_params(rfid_t *rfid, uint8_t *control);
+int rfid_6c_monza4qt_set_params(rfid_t *rfid, uint8_t control);
+int rfid_6c_extended_read(rfid_t *rfid, uint8_t mem, uint16_t word_ptr, uint8_t num, uint8_t *data);
+int rfid_6c_extended_write(rfid_t *rfid, uint8_t mem, uint16_t word_ptr, uint8_t num, uint8_t *data);
+void rfid_6c_tag_inventory_buffer (rfid_t *rfid, uint8_t q_value, uint8_t session, uint8_t tid_addr, uint8_t tid_len,
+                                   uint8_t target, uint8_t ant, uint8_t scan_time,
+                                   uint16_t *buff_cnt, uint16_t *tag_num);
+int rfid_6c_mix_inventory(rfid_t *rfid, uint8_t q_value, uint8_t session, uint8_t read_mem, uint16_t read_addr, uint8_t read_len,
+                          uint8_t target, uint8_t ant, uint8_t scan_time, rfid_stat_t *stat, tag_inventory_cb tag_callback);
+int rfid_6c_epc_inventory(rfid_t *rfid, uint8_t match_type, uint16_t match_len, uint16_t match_offset, uint8_t *epc_data,
+                          tag_inventory_cb tag_callback);
+int rfid_6c_qt_inventory(rfid_t *rfid, uint8_t q_value, uint8_t session, uint8_t target, uint8_t ant, uint8_t scan_time,
+                         rfid_stat_t *stat, tag_inventory_cb tag_callback);
 
+// ---------------------------------------------------------------------------------------------------------------------
+// --- ISO18000-6B commands --------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------
 
-
-
+// ---------------------------------------------------------------------------------------------------------------------
+// --- Reader custom commands ------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------
 int rfid_x_get_reader_information(rfid_t *rfid, rfid_reader_info_t *info);
 int rfid_x_set_working_frequency(rfid_t *rfid, uint8_t max_freq, uint8_t min_freq);
 int rfid_x_set_reader_address(rfid_t *rfid, uint8_t new_addr);
@@ -165,6 +207,9 @@ int rfid_x_get_drm(rfid_t *rfid, uint8_t *drm_mode);
 int rfid_x_get_antenna_return_loss(rfid_t *rfid, uint32_t test_freq, uint8_t antenna, uint8_t *return_loss);
 int rfid_x_get_temperature(rfid_t *rfid, int *temp);
 
+// ---------------------------------------------------------------------------------------------------------------------
+// -- EM4325 commands --------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------------
 int rfid_em4325_sync_timestamp(rfid_t *rfid, uint32_t utc_time);
 int rfid_em4325_get_temperature(rfid_t *rfid, uint8_t send_uid, uint8_t new_sample, uint8_t *uid,
                                 uint32_t *sensor_data, uint32_t *utc_time);
